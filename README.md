@@ -1,4 +1,4 @@
-# Diagrama de Flujo - Arquitectura v3.1.0
+# Diagrama de Flujo - Arquitectura Login Con B2C usando Custom Web View
 
 Este documento describe el flujo completo de autenticación implementado en la versión 3.1.0, utilizando el patrón de **Inversión de Control** donde la aplicación crea y gestiona el `WKWebView` en lugar de delegarlo a MSAL.
 
