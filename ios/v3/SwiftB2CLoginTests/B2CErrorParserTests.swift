@@ -14,7 +14,6 @@ struct B2CErrorParserTests {
         let jsonString = """
         {"status": "400", "errorCode": "B2C0001", "message": "Token validation failed"}
         """
-        let data = jsonString.data(using: .utf8)!
         
         let userInfo: [String: Any] = ["MSALErrorDescriptionKey": jsonString]
         let error = NSError(domain: "MSALErrorDomain", code: -50000, userInfo: userInfo)

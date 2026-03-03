@@ -6,13 +6,10 @@ enum B2CErrorParser {
     
     // MARK: - Cached Regex (compiled once for performance)
     
-    private static let cachedRegexPatterns: [NSRegularExpression] = {
-        let patterns = [
-            #"\{[^{}]*"errorCode"\s*:\s*"[^"]+"\s*[^{}]*\}"#,
-            #"\{"status"[^}]+"errorCode"[^}]+"message"[^}]+\}"#
-        ]
-        return patterns.compactMap { try? NSRegularExpression(pattern: $0, options: .caseInsensitive) }
-    }()
+    private static let cachedRegexPatterns: [Regex<AnyRegexOutput>] = [
+        try! Regex(#"\{[^{}]*"errorCode"\s*:\s*"[^"]+"\s*[^{}]*\}"#).ignoresCase(),
+        try! Regex(#"\{"status"[^}]+"errorCode"[^}]+"message"[^}]+\}"#).ignoresCase()
+    ]
     
     // MARK: - Cached JSON Decoder
     
@@ -75,14 +72,10 @@ enum B2CErrorParser {
     }
     
     private static func extractFromEmbeddedJSON(_ text: String) -> B2CCustomError? {
-        // Usar regex cacheados para mejor performance
         for regex in cachedRegexPatterns {
-            guard let match = regex.firstMatch(in: text, range: NSRange(text.startIndex..., in: text)),
-                  let range = Range(match.range, in: text) else {
-                continue
-            }
+            guard let match = text.firstMatch(of: regex) else { continue }
             
-            let jsonString = String(text[range])
+            let jsonString = String(text[match.range])
             if let error = decode(from: jsonString) {
                 return error
             }
@@ -113,10 +106,16 @@ extension B2CErrorParser {
         static let error = "error"
     }
     
-    /// Extrae un error B2C de los query params de una URL.
+    // MARK: - Not called at runtime (test-only)
+    
+    /// Extrae un error B2C personalizado de los query parameters de una URL.
     ///
     /// Azure B2C inyecta errores en la URL durante validaciones fallidas.
     /// Este método parsea esos query params y construye un `B2CCustomError`.
+    ///
+    /// > Note: Este método no se invoca en runtime desde v3.1.
+    /// > Se mantiene por su cobertura de tests y utilidad potencial
+    /// > para integraciones futuras con flujos custom.
     ///
     /// - Parameter url: URL con posibles query params de error.
     /// - Returns: `B2CCustomError` si se encuentra un código de error, `nil` en otro caso.
@@ -170,14 +169,11 @@ extension B2CErrorParser {
     }
     
     /// Intenta extraer un código B2C (ej: "B2C0001") de un mensaje.
+    private static let b2cCodePattern = /B2C\d{4}/
+    
     private static func extractB2CCode(from message: String) -> String? {
-        let pattern = #"B2C\d{4}"#
-        guard let regex = try? NSRegularExpression(pattern: pattern),
-              let match = regex.firstMatch(in: message, range: NSRange(message.startIndex..., in: message)),
-              let range = Range(match.range, in: message) else {
-            return nil
-        }
-        return String(message[range])
+        guard let match = message.firstMatch(of: b2cCodePattern) else { return nil }
+        return String(match.output)
     }
 }
 

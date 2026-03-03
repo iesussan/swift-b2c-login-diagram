@@ -2,7 +2,6 @@ import SwiftUI
 import MSAL
 
 /// Entry point de la aplicación.
-/// Ver: DIAGRAM-FLOW.md para el flujo completo de autenticación.
 @main
 struct SwiftB2CLoginApp: App {
     
@@ -15,7 +14,6 @@ struct SwiftB2CLoginApp: App {
             LoginView()
                 .environment(authService)
                 .task {
-                    // [FLOW #1] Pre-calentar el servicio lo antes posible
                     await authService.warmUp()
                 }
                 .onOpenURL { url in

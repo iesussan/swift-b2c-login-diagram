@@ -79,10 +79,6 @@ struct AuthenticatedUser: Equatable, Sendable {
         let emails: [String]
         let objectId: String?
         
-        /// Raw claims como JSON string (Sendable-safe)
-        /// Usar `decodedRaw` para acceder como diccionario
-        let rawJSON: String?
-        
         var primaryEmail: String? { emails.first }
         var fullName: String? {
             [givenName, familyName]
@@ -91,26 +87,11 @@ struct AuthenticatedUser: Equatable, Sendable {
                 .nilIfEmpty
         }
         
-        /// Decodifica rawJSON a diccionario cuando se necesite
-        var decodedRaw: [String: Any]? {
-            guard let json = rawJSON,
-                  let data = json.data(using: .utf8) else { return nil }
-            return try? JSONSerialization.jsonObject(with: data) as? [String: Any]
-        }
-        
-        /// Inicializador con diccionario raw (serializa a JSON)
-        init(givenName: String?, familyName: String?, emails: [String], objectId: String?, raw: [String: Any]) {
+        init(givenName: String?, familyName: String?, emails: [String], objectId: String?) {
             self.givenName = givenName
             self.familyName = familyName
             self.emails = emails
             self.objectId = objectId
-            
-            if let data = try? JSONSerialization.data(withJSONObject: raw),
-               let jsonString = String(data: data, encoding: .utf8) {
-                self.rawJSON = jsonString
-            } else {
-                self.rawJSON = nil
-            }
         }
     }
 }

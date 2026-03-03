@@ -1,13 +1,7 @@
 import Foundation
 import UIKit
-import WebKit
 import MSAL
 import Observation
-
-// ═══════════════════════════════════════════════════════════════════════════════
-// IMPORTANTE: Los marcadores [FLOW #X] corresponden al diagrama de secuencia
-// documentado en DIAGRAM-FLOW.md. Consultar ese archivo para contexto visual.
-// ═══════════════════════════════════════════════════════════════════════════════
 
 /// Servicio de autenticación con Microsoft Authentication Library (MSAL).
 ///
@@ -42,8 +36,8 @@ final class AuthenticationService {
     private var msalApplication: MSALPublicClientApplication?
     private let logger: any Logger & Sendable
     
-    /// Observer para detectar errores B2C en URL (pushState/replaceState).
-    private var webViewObserver: B2CWebViewObserver?
+    /// Instrumentación de tiempos del flujo de autenticación.
+    let tracer: AuthFlowTracer
     
     /// Continuations esperando que el servicio se inicialice.
     private var initializationContinuations: [CheckedContinuation<Void, Never>] = []
@@ -52,31 +46,38 @@ final class AuthenticationService {
     
     nonisolated init(logger: some Logger & Sendable = PrintLogger()) {
         self.logger = logger
+        self.tracer = AuthFlowTracer(logger: logger)
         // No inicializar automáticamente - usar warmUp() explícitamente
     }
     
-    // MARK: - [FLOW #1-6] Warm Up
+    // MARK: - Warm Up
     
     /// Inicializa el servicio y pre-calienta recursos.
-    /// Llamar lo antes posible, idealmente en el App struct.
+    ///
+    /// Crea la instancia de `MSALPublicClientApplication` y pre-fetches DNS+TLS
+    /// al dominio B2C. Llamar lo antes posible, idealmente en el App struct.
     func warmUp() async {
         guard !isInitialized else { return }
         
-        // [FLOW #2] Inicializar observer en contexto MainActor
-        webViewObserver = B2CWebViewObserver()
+        tracer.begin(.warmUp)
+        tracer.checkpoint(.warmUpStart)
         
-        // [FLOW #3] Inicializar MSAL (internamente llama a createMSALApplication)
-        await initializeMSAL()
+        initializeMSAL()
+        tracer.checkpoint(.msalAppCreated)
         
-        // [FLOW #6] Marcar como inicializado
+        // DNS pre-resolution (fire-and-forget): cachear la conexión TCP/TLS
+        // al endpoint B2C en paralelo, sin bloquear la inicialización.
+        Task { await prefetchB2CDomain() }
+        
         isInitialized = true
         
-        // Notificar a todos los que esperaban inicialización
         for continuation in initializationContinuations {
             continuation.resume()
         }
         initializationContinuations.removeAll()
         
+        tracer.checkpoint(.warmUpEnd)
+        tracer.end(.warmUp)
         logger.info("AuthenticationService warm up complete")
     }
     
@@ -89,9 +90,12 @@ final class AuthenticationService {
         }
     }
     
-    // MARK: - [FLOW #12-13, #32-41] Public Methods
+    // MARK: - Public Methods
     
     /// Inicia el flujo de autenticación interactivo.
+    ///
+    /// Usa `ASWebAuthenticationSession` (MSAL default) para presentar
+    /// el diálogo de autenticación del sistema. Soporta SSO con Safari.
     func signIn(from viewController: UIViewController) async {
         // Esperar inicialización si es necesario
         await waitForInitialization()
@@ -101,71 +105,39 @@ final class AuthenticationService {
             return
         }
         
-        // [FLOW #13] Actualizar estado a authenticating
+        // Instrumentación: nueva sesión de medición
+        tracer.reset()
+        tracer.begin(.interactiveSignIn)
+        tracer.checkpoint(.signInTapped)
+        
         state = .authenticating
         
         do {
-            // [FLOW #14-23] Flujo interactivo completo
             let result = try await acquireTokenInteractively(
                 application: application,
                 from: viewController
             )
-            // [FLOW #32-33] Éxito: mapear resultado y actualizar estado
-            state = .authenticated(mapToUser(result))
-            logger.info("Authentication successful for: \(result.account.username ?? "unknown")")
+            let user = mapToUser(result)
+            tracer.checkpoint(.userMapped)
+            state = .authenticated(user)
+            tracer.checkpoint(.signInComplete)
+            tracer.end(.interactiveSignIn)
+            tracer.printSummary()
+            
+            let displayName = user.claims.primaryEmail ?? user.claims.fullName ?? "unknown"
+            logger.info("Authentication successful for: \(displayName)")
         } catch {
-            // [FLOW #34-41] Manejo de errores
-            // === Logging detallado del error ===
-            logger.debug("=== MSAL Error Analysis ===")
-            logger.debug("Error type: \(type(of: error))")
+            logMSALError(error)
             
-            let nsError = error as NSError
-            logger.debug("Domain: \(nsError.domain)")
-            logger.debug("Code: \(nsError.code)")
-            logger.debug("Description: \(nsError.localizedDescription)")
-            
-            // Log userInfo keys y valores (truncados)
-            for (key, value) in nsError.userInfo {
-                let valueStr = String(describing: value)
-                let truncated = valueStr.count > 300 ? String(valueStr.prefix(300)) + "..." : valueStr
-                logger.debug("  userInfo[\(key)]: \(truncated)")
-            }
-            
-            // Intentar parsear error B2C de MSAL
-            if let customError = B2CErrorParser.parse(from: error) {
-                logger.debug("Parsed B2C Custom Error from MSAL:")
-                logger.debug("   Code: \(customError.errorCode)")
-                logger.debug("   Message: \(customError.message)")
-                logger.debug("   Status: \(customError.status)")
-                logger.debug("   Recoverable: \(customError.isRetryable)")
-            } else {
-                logger.debug("No B2C custom error found in MSAL error payload")
-            }
-            
-            // [FLOW #35-37] Verificar si hay un error B2C detectado previamente via WebView observer
-            // (puede venir de postMessage/DOM o de parseo de URL como fallback)
-            if let detectedError = webViewObserver?.lastDetectedError {
-                logger.debug("Using previously detected B2C error from WebView observer:")
-                logger.debug("   Code: \(detectedError.errorCode)")
-                logger.debug("   Message: \(detectedError.message)")
-                logger.debug("===========================")
-                webViewObserver?.reset()
-                state = .failed(.custom(detectedError))
-                return
-            }
-            
-            // [FLOW #38] Parsear error con B2CErrorParser como fallback
             let authError = B2CErrorParser.toAuthError(error)
-            logger.debug("Final AuthError: \(authError)")
-            logger.debug("===========================")
-            
-            // [FLOW #41] Actualizar estado a failed
             state = .failed(authError)
+            tracer.end(.interactiveSignIn)
+            tracer.printSummary()
             logger.error("Authentication failed: \(authError.userMessage)")
         }
     }
     
-    // MARK: - [FLOW #7-10] Silent Authentication
+    // MARK: - Silent Authentication
     
     /// Intenta autenticación silenciosa usando tokens en caché.
     func signInSilently() async {
@@ -174,63 +146,46 @@ final class AuthenticationService {
         
         guard let application = msalApplication else { return }
         
+        tracer.begin(.silentSignIn)
+        tracer.checkpoint(.silentSignInStart)
+        
         do {
-            // [FLOW #8] Buscar cuentas en Keychain
             guard let account = try application.allAccounts().first else {
-                // [FLOW #9-10] Sin cuenta cacheada, mantener idle
+                tracer.end(.silentSignIn)
                 logger.debug("No cached account found")
                 return
             }
             
             state = .authenticating
+            tracer.checkpoint(.silentTokenRequested)
             let result = try await acquireTokenSilently(
                 application: application,
                 account: account
             )
             state = .authenticated(mapToUser(result))
+            tracer.checkpoint(.silentSignInEnd)
+            tracer.end(.silentSignIn)
+            tracer.printSummary()
             logger.info("Silent authentication successful")
         } catch {
+            tracer.checkpoint(.silentSignInEnd)
+            tracer.end(.silentSignIn)
+            tracer.printSummary()
             logger.debug("Silent auth failed: \(error.localizedDescription)")
             state = .idle
         }
     }
     
-    // MARK: - [FLOW #15-16] WebView Factory
-    
-    /// Crea un WKWebView configurado con las optimizaciones de rendimiento v3.1.
-    /// [FLOW #15] Factory method para crear el WebView customizado.
-    private func createConfiguredWebView() -> WKWebView {
-        let config = WKWebViewConfiguration()
-        
-        // v3.1: Apple gestiona automáticamente el processPool desde iOS 15.
-        // Ya no es necesario (ni recomendado) asignarlo manualmente.
-        
-        // Persistencia de sesión B2C
-        config.websiteDataStore = .default()
-        
-        // Optimización de Renderizado (MSAL 2.8.x style)
-        config.suppressesIncrementalRendering = true
-        config.allowsInlineMediaPlayback = true
-        
-        // [FLOW #16] Crear instancia de WKWebView con la configuración
-        let webView = WKWebView(frame: .zero, configuration: config)
-        webView.translatesAutoresizingMaskIntoConstraints = false
-        
-        // Seguridad: Evitar swipe back que rompe el flujo de B2C
-        webView.allowsBackForwardNavigationGestures = false
-        
-        #if DEBUG
-        if #available(iOS 16.4, *) {
-            webView.isInspectable = true
-        }
-        #endif
-        
-        return webView
-    }
-    
     /// Cierra la sesión del usuario actual.
     func signOut() async {
         guard let application = msalApplication else { return }
+        
+        tracer.begin(.signOut)
+        tracer.checkpoint(.signOutStart)
+        defer {
+            tracer.checkpoint(.signOutEnd)
+            tracer.end(.signOut)
+        }
         
         do {
             for account in try application.allAccounts() {
@@ -251,15 +206,14 @@ final class AuthenticationService {
         }
     }
     
-    // MARK: - [FLOW #3-5] Private Methods
+    // MARK: - Private Methods
     
-    /// Inicializa MSAL.
-    /// [FLOW #3] Llamado desde warmUp()
-    private func initializeMSAL() async {
+    /// Inicializa MSAL creando la instancia de `MSALPublicClientApplication`.
+    private func initializeMSAL() {
+        configureMSALLogging()
         logger.debug(B2CConfiguration.debugDescription)
         
         do {
-            // [FLOW #4-5] Crear y retornar MSALPublicClientApplication
             msalApplication = try createMSALApplication()
             logger.info("MSAL initialized successfully")
         } catch {
@@ -285,55 +239,90 @@ final class AuthenticationService {
         return try MSALPublicClientApplication(configuration: config)
     }
     
-    // MARK: - [FLOW #14-23] Interactive Token Acquisition
+    /// Configura el logging interno de MSAL para capturar sub-fases
+    /// del flujo interactivo como checkpoints del tracer.
+    private func configureMSALLogging() {
+        MSALGlobalConfig.loggerConfig.logLevel = .verbose
+        MSALGlobalConfig.loggerConfig.logMaskingLevel = .settingsMaskAllPII
+        
+        // Mapa de keywords MSAL → milestones del tracer.
+        // MSAL emite logs en hilos internos; los checkpoints se
+        // despachan a @MainActor para consistencia con el tracer.
+        let tracer = self.tracer
+        MSALGlobalConfig.loggerConfig.setLogCallback { _, message, _ in
+            guard let message else { return }
+            
+            let keyword: AuthFlowTracer.Milestone? = if message.localizedStandardContains("Start webview authorization session") {
+                .browserPresented
+            } else if message.localizedStandardContains("Resolving authority") {
+                .authorityValidated
+            } else if message.localizedStandardContains("Result from authorization session") {
+                .redirectReceived
+            } else if message.localizedStandardContains("Sending network request") {
+                .tokenExchangeStart
+            } else {
+                nil
+            }
+            
+            if let milestone = keyword {
+                Task { @MainActor in
+                    tracer.checkpoint(milestone)
+                }
+            }
+        }
+    }
     
+    /// Pre-fetches DNS y establece conexión TCP/TLS con el dominio B2C.
+    private func prefetchB2CDomain() async {
+        guard let url = URL(string: "https://\(B2CConfiguration.tenantName).b2clogin.com") else { return }
+        
+        var request = URLRequest(url: url)
+        request.httpMethod = "HEAD"
+        request.timeoutInterval = 5
+        
+        do {
+            let _ = try await URLSession.shared.data(for: request)
+            logger.debug("B2C domain prefetch complete (DNS + TLS cached)")
+        } catch {
+            logger.debug("B2C domain prefetch failed (non-critical): \(error.localizedDescription)")
+        }
+    }
+    
+    /// Registra los detalles de un error MSAL en el log para diagnóstico.
+    private func logMSALError(_ error: Error) {
+        let nsError = error as NSError
+        logger.debug("=== MSAL Error Analysis ===")
+        logger.debug("Domain: \(nsError.domain) | Code: \(nsError.code)")
+        logger.debug("Description: \(nsError.localizedDescription)")
+        
+        for (key, value) in nsError.userInfo {
+            let valueStr = String(describing: value)
+            let truncated = valueStr.count > 300 ? String(valueStr.prefix(300)) + "..." : valueStr
+            logger.debug("  userInfo[\(key)]: \(truncated)")
+        }
+        
+        if let customError = B2CErrorParser.parse(from: error) {
+            logger.debug("B2C Error → \(customError.errorCode): \(customError.message)")
+        }
+        logger.debug("===========================")
+    }
+    
+    // MARK: - Interactive Token Acquisition
+    
+    /// Adquiere un token interactivamente usando ASWebAuthenticationSession.
+    ///
+    /// MSAL gestiona la presentación y dismiss del diálogo de autenticación
+    /// automáticamente.
     private func acquireTokenInteractively(
         application: MSALPublicClientApplication,
         from viewController: UIViewController
     ) async throws -> MSALResult {
-        // [FLOW #14] Resetear observer antes de iniciar
-        webViewObserver?.reset()
-        
-        // [FLOW #15-16] v3.1: Crear WebView con factory
-        let customWebView = createConfiguredWebView()
-        // [FLOW #17] Conectar observer al WebView (KVO desde t=0)
-        webViewObserver?.observe(customWebView)
-        
-        // [FLOW #19] CRITICAL FIX: Presentar el WebView en un UIViewController modal
-        // Evita errores de jerarquía con UIHostingController al no modificar su view directamente.
-        let webAuthVC = UIViewController()
-        webAuthVC.modalPresentationStyle = .pageSheet // Estilo adecuado para login
-        webAuthVC.view.backgroundColor = .systemBackground
-        // [FLOW #20] Añadir WebView como subview del modal
-        webAuthVC.view.addSubview(customWebView)
-        
-        NSLayoutConstraint.activate([
-            customWebView.topAnchor.constraint(equalTo: webAuthVC.view.safeAreaLayoutGuide.topAnchor),
-            customWebView.bottomAnchor.constraint(equalTo: webAuthVC.view.bottomAnchor),
-            customWebView.leadingAnchor.constraint(equalTo: webAuthVC.view.leadingAnchor),
-            customWebView.trailingAnchor.constraint(equalTo: webAuthVC.view.trailingAnchor)
-        ])
-        
-        // [FLOW #21] Presentar el controlador modalmente para evitar conflictos con SwiftUI
-        viewController.present(webAuthVC, animated: true)
-        
-        defer {
-            // [FLOW #30] Detener observación
-            webViewObserver?.stopObserving()
-            // [FLOW #31] Limpieza: Cerrar el modal al terminar
-            webAuthVC.dismiss(animated: true)
-        }
-        
-        return try await withCheckedThrowingContinuation { continuation in
-            // [FLOW #22] Configurar parámetros de WebView para MSAL
-            // FIX: Usamos 'viewController' (el padre original) porque 'webAuthVC' 
-            // aún no está en la jerarquía de ventanas (la animación de present no terminó)
-            // y MSAL valida validController.view.window != nil.
+        try await withCheckedThrowingContinuation { continuation in
+            // .default usa ASWebAuthenticationSession (iOS 12+)
+            // Comparte cookies con Safari → SSO automático
             let webViewParameters = MSALWebviewParameters(
                 authPresentationViewController: viewController
             )
-            webViewParameters.webviewType = .wkWebView
-            webViewParameters.customWebview = customWebView
             
             let parameters = MSALInteractiveTokenParameters(
                 scopes: B2CConfiguration.scopes,
@@ -344,13 +333,19 @@ final class AuthenticationService {
             let hasAccounts = (try? application.allAccounts().isEmpty == false) ?? false
             parameters.promptType = hasAccounts ? .login : .selectAccount
             
-            // [FLOW #23] Invocar MSAL para adquirir token
-            // [FLOW #24-28] La navegación B2C ocurre aquí (ver B2CWebViewObserver)
-            // [FLOW #29] Callback con resultado o error
+            // Instrumentación: medir duración del round-trip MSAL ↔ B2C
+            self.tracer.checkpoint(.msalAcquireTokenStart)
+            self.tracer.begin(.msalTokenAcquire)
+            
             application.acquireToken(with: parameters) { result, error in
                 if let error {
+                    Task { @MainActor in self.tracer.end(.msalTokenAcquire) }
                     continuation.resume(throwing: error)
                 } else if let result {
+                    Task { @MainActor in
+                        self.tracer.checkpoint(.tokenReceived)
+                        self.tracer.end(.msalTokenAcquire)
+                    }
                     continuation.resume(returning: result)
                 } else {
                     continuation.resume(throwing: AuthError.unknown("No result returned"))
@@ -391,8 +386,7 @@ final class AuthenticationService {
                 givenName: claims["given_name"] as? String,
                 familyName: claims["family_name"] as? String,
                 emails: claims["emails"] as? [String] ?? [],
-                objectId: claims["oid"] as? String,
-                raw: claims
+                objectId: claims["oid"] as? String
             ),
             expiresOn: result.expiresOn
         )

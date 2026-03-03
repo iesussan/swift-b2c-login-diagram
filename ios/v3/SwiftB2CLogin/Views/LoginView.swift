@@ -1,7 +1,7 @@
 import SwiftUI
+import QuartzCore
 
 /// Vista principal de login.
-/// Ver: DIAGRAM-FLOW.md para el flujo completo de autenticación.
 struct LoginView: View {
     @Environment(AuthenticationService.self) private var authService
     
@@ -25,7 +25,17 @@ struct LoginView: View {
                 
                 Spacer()
                 
-                contentView
+                switch authService.state {
+                case .idle, .failed:
+                    SignInButtonView(action: signIn)
+                    
+                case .authenticating:
+                    ProgressView("Autenticando...")
+                        .progressViewStyle(.circular)
+                    
+                case .authenticated(let user):
+                    AuthenticatedView(user: user, authService: authService)
+                }
                 
                 // Error después del flujo
                 if let error = authService.state.error {
@@ -42,39 +52,18 @@ struct LoginView: View {
             .toolbar(.hidden, for: .navigationBar)
             .animation(.easeInOut, value: authService.state)
         }
+        .onAppear {
+            // Medir First Frame: el completion se invoca cuando
+            // Core Animation commitea el frame al render server.
+            CATransaction.begin()
+            CATransaction.setCompletionBlock {
+                authService.tracer.checkpoint(.firstFrameRendered)
+            }
+            CATransaction.commit()
+        }
         .task {
-            // [FLOW #7] Intento de auto-login silencioso al aparecer la vista
             await authService.signInSilently()
         }
-    }
-    
-    @ViewBuilder
-    private var contentView: some View {
-        switch authService.state {
-        case .idle, .failed:
-            signInButton
-            
-        case .authenticating:
-            ProgressView("Autenticando...")
-                .progressViewStyle(.circular)
-            
-        case .authenticated(let user):
-            AuthenticatedView(user: user, authService: authService)
-        }
-    }
-    
-    private var signInButton: some View {
-        // [FLOW #11] Usuario presiona botón de login
-        Button("Iniciar Sesión con Azure B2C", systemImage: "person.badge.key") {
-            Task { await signIn() }  // [FLOW #12] Invoca signIn()
-        }
-        .font(.headline)
-        .foregroundStyle(.white)
-        .frame(maxWidth: .infinity)
-        .padding()
-        .background(.blue)
-        .clipShape(.rect(cornerRadius: 12))
-        .padding(.horizontal, 40)
     }
     
     @MainActor
@@ -84,6 +73,25 @@ struct LoginView: View {
             return
         }
         await authService.signIn(from: rootVC)
+    }
+}
+
+// MARK: - Sign In Button
+
+private struct SignInButtonView: View {
+    let action: () async -> Void
+    
+    var body: some View {
+        Button("Iniciar Sesión con Azure B2C", systemImage: "person.badge.key") {
+            Task { await action() }
+        }
+        .font(.headline)
+        .foregroundStyle(.white)
+        .frame(maxWidth: .infinity)
+        .padding()
+        .background(.blue)
+        .clipShape(.rect(cornerRadius: 12))
+        .padding(.horizontal, 40)
     }
 }
 
@@ -102,7 +110,7 @@ private struct AuthenticatedView: View {
             
             Text("¡Autenticado!")
                 .font(.title)
-                .fontWeight(.semibold)
+                .bold()
             
             UserInfoCard(claims: user.claims)
             
@@ -137,7 +145,7 @@ private struct UserInfoCard: View {
         }
         .padding()
         .frame(maxWidth: .infinity, alignment: .leading)
-        .background(Color(.systemGray6))
+        .background(.thinMaterial)
         .clipShape(.rect(cornerRadius: 12))
         .padding(.horizontal)
     }
@@ -150,7 +158,7 @@ private struct InfoRow: View {
     var body: some View {
         HStack {
             Text(label + ":")
-                .fontWeight(.semibold)
+                .bold()
             Text(value)
         }
         .font(.subheadline)

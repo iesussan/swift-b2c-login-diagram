@@ -81,28 +81,10 @@ extension AuthError {
         }
     }
     
-    /// Indica si es un error custom de B2C
-    var isCustomB2CError: Bool {
-        if case .custom = self { return true }
-        return false
-    }
-    
     /// Obtiene el error B2C si existe
     var b2cError: B2CCustomError? {
         if case .custom(let error) = self { return error }
         return nil
-    }
-    
-    /// Indica si el usuario puede reintentar
-    var isRetryable: Bool {
-        switch self {
-        case .cancelled, .network:
-            return true
-        case .custom(let error):
-            return !error.isMaxAttemptsError && !error.isUserBlockedError
-        default:
-            return false
-        }
     }
 }
 

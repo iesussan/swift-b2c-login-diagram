@@ -1,50 +1,81 @@
 import Foundation
+import os
 
 // MARK: - Logger Protocol
 
 /// Protocolo para logging en la aplicación.
 /// Permite inyección de dependencias y testing.
 protocol Logger: Sendable {
-    /// Log de debug - Solo en builds DEBUG
+    /// Log de debug — solo en builds DEBUG.
     func debug(_ message: String)
-    
-    /// Log informativo - Eventos normales
+
+    /// Log informativo — eventos normales.
     func info(_ message: String)
-    
-    /// Log de error - Problemas que requieren atención
+
+    /// Log de error — problemas que requieren atención.
     func error(_ message: String)
+
+    /// Log de rendimiento — métricas de tiempos y checkpoints.
+    func performance(_ message: String)
 }
 
 // MARK: - Print Logger
 
-/// Implementación de Logger que imprime a la consola.
-/// Thread-safe gracias a conformancia con Sendable.
+/// Implementación de Logger con formato columnar alineado.
+///
+/// Formato: `HH:mm:ss.SSS ┃ LEVEL ┃ message`
+/// - `print()` para consola Xcode (solo DEBUG builds).
+/// - `os.Logger` para Instruments y Console.app (todos los builds).
 struct PrintLogger: Logger, Sendable {
-    
+
+    private static let osLog = os.Logger(
+        subsystem: "org.cloud.anonymous.SwiftB2CLogin",
+        category: "Auth"
+    )
+
     func debug(_ message: String) {
         #if DEBUG
-        print("[DEBUG] \(Self.timestamp()) \(message)")
+        emit("DEBUG", message)
         #endif
     }
-    
+
     func info(_ message: String) {
-        print("[INFO] \(Self.timestamp()) \(message)")
+        #if DEBUG
+        emit("INFO ", message)
+        #else
+        Self.osLog.info("\(message)")
+        #endif
     }
-    
+
     func error(_ message: String) {
-        print("[ERROR] \(Self.timestamp()) \(message)")
+        #if DEBUG
+        emit("ERROR", message)
+        #else
+        Self.osLog.error("\(message)")
+        #endif
     }
-    
+
+    func performance(_ message: String) {
+        #if DEBUG
+        emit("PERF ", message)
+        #else
+        Self.osLog.notice("\(message)")
+        #endif
+    }
+
     // MARK: - Private
-    
-    private static let cachedFormatter: DateFormatter = {
-        let formatter = DateFormatter()
-        formatter.dateStyle = .none
-        formatter.timeStyle = .medium
-        return formatter
-    }()
-    
+
+    private func emit(_ level: String, _ message: String) {
+        print("\(Self.timestamp()) ┃ \(level) ┃ \(message)")
+    }
+
+    private static let timestampFormat: Date.FormatStyle = Date.FormatStyle()
+        .hour(.twoDigits(amPM: .omitted))
+        .minute(.twoDigits)
+        .second(.twoDigits)
+        .secondFraction(.fractional(3))
+
     private static func timestamp() -> String {
-        cachedFormatter.string(from: Date())
+        Date.now.formatted(timestampFormat)
     }
 }

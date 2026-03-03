@@ -28,30 +28,21 @@ enum B2CConfiguration {
         "https://\(tenantName).b2clogin.com/\(tenantName).onmicrosoft.com/\(signUpSignInPolicy)"
     }
     
-    /// Keychain group para el dispositivo
-    static var keychainGroup: String {
-        #if targetEnvironment(simulator)
-        return Bundle.main.bundleIdentifier ?? "com.app.default"
-        #else
-        return "com.microsoft.adalcache"
-        #endif
-    }
-    
-    /// Indica si estamos en simulador
-    static var isSimulator: Bool {
-        #if targetEnvironment(simulator)
-        return true
-        #else
-        return false
-        #endif
-    }
 }
 
 // MARK: - Debug Description
 
 extension B2CConfiguration {
     static var debugDescription: String {
-        """
+        #if targetEnvironment(simulator)
+        let environment = "SIMULATOR"
+        let keychain = Bundle.main.bundleIdentifier ?? "com.app.default"
+        #else
+        let environment = "DEVICE"
+        let keychain = "com.microsoft.adalcache"
+        #endif
+        
+        return """
         === B2C Configuration ===
         Tenant: \(tenantName)
         Client ID: \(clientId)
@@ -59,8 +50,8 @@ extension B2CConfiguration {
         Redirect URI: \(redirectUri)
         Authority URL: \(authorityURL)
         Scopes: \(scopes.isEmpty ? "[default: openid, profile]" : scopes.joined(separator: ", "))
-        Keychain Group: \(keychainGroup)
-        Environment: \(isSimulator ? "SIMULATOR" : "DEVICE")
+        Keychain Group: \(keychain)
+        Environment: \(environment)
         ===========================
         """
     }

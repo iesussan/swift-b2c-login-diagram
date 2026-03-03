@@ -10,10 +10,12 @@ struct AuthenticationServiceTests {
     // MARK: - Test Helpers
     
     /// Logger mock para capturar mensajes en tests
-    final class MockLogger: Logger, @unchecked Sendable {
+    @MainActor
+    final class MockLogger: Logger, Sendable {
         var debugMessages: [String] = []
         var infoMessages: [String] = []
         var errorMessages: [String] = []
+        var performanceMessages: [String] = []
         
         func debug(_ message: String) {
             debugMessages.append(message)
@@ -27,10 +29,15 @@ struct AuthenticationServiceTests {
             errorMessages.append(message)
         }
         
+        func performance(_ message: String) {
+            performanceMessages.append(message)
+        }
+        
         func reset() {
             debugMessages.removeAll()
             infoMessages.removeAll()
             errorMessages.removeAll()
+            performanceMessages.removeAll()
         }
     }
     
@@ -46,7 +53,7 @@ struct AuthenticationServiceTests {
         
         // El estado debe ser idle o failed (si MSAL no puede inicializar sin config real)
         let validStates: [AuthState] = [.idle, .failed(.configuration(""))]
-        let isValidState = service.state == .idle || service.state.error?.isCustomB2CError == false
+        let isValidState = service.state == .idle || service.state.error != nil
         
         #expect(isValidState || service.state.error != nil)
     }
@@ -112,8 +119,7 @@ struct AuthenticationServiceTests {
             givenName: "John",
             familyName: "Doe",
             emails: ["john@example.com"],
-            objectId: "123",
-            raw: [:]
+            objectId: "123"
         )
         let user = AuthenticatedUser(
             accessToken: "token",
@@ -147,11 +153,11 @@ struct AuthenticationServiceTests {
         #expect(AuthError.notInitialized.severity == .critical)
     }
     
-    @Test("AuthError retryable property")
-    func authErrorRetryable() {
-        #expect(AuthError.cancelled.isRetryable == true)
-        #expect(AuthError.network("error").isRetryable == true)
-        #expect(AuthError.configuration("bad").isRetryable == false)
-        #expect(AuthError.notInitialized.isRetryable == false)
+    @Test("AuthError b2cError extraction")
+    func authErrorB2CExtraction() {
+        let b2cError = B2CCustomError(status: "400", errorCode: "B2C0001", message: "test")
+        let error = AuthError.custom(b2cError)
+        #expect(error.b2cError == b2cError)
+        #expect(AuthError.cancelled.b2cError == nil)
     }
 }
