@@ -39,6 +39,21 @@ final class AuthenticationService {
     /// Instrumentación de tiempos del flujo de autenticación.
     let tracer: AuthFlowTracer
     
+    /// Cuentas MSAL pre-cacheadas desde `warmUp()`.
+    ///
+    /// En dispositivos con shared keychain (`com.microsoft.adalcache`),
+    /// `allAccounts()` puede tomar segundos escaneando entries de
+    /// Outlook/Teams/OneDrive. Pre-cachear durante `warmUp()` evita
+    /// bloquear main thread en flujos interactivos.
+    private var cachedAccounts: [MSALAccount] = []
+    
+    /// Task que pre-cachea cuentas del Keychain.
+    ///
+    /// Almacenar la referencia permite a `signInSilently()` y `signOut()`
+    /// hacer `await accountsCacheTask?.value` para garantizar que el
+    /// cache esté poblado antes de leer `cachedAccounts`.
+    private var accountsCacheTask: Task<Void, Never>?
+    
     /// Continuations esperando que el servicio se inicialice.
     private var initializationContinuations: [CheckedContinuation<Void, Never>] = []
     
@@ -64,6 +79,17 @@ final class AuthenticationService {
         
         initializeMSAL()
         tracer.checkpoint(.msalAppCreated)
+        
+        // Pre-cachear cuentas del Keychain.
+        // En dispositivos con shared keychain (com.microsoft.adalcache),
+        // allAccounts() puede tomar segundos — no bloquear warmUp().
+        // La referencia permite a signInSilently() esperar el resultado.
+        if let app = msalApplication {
+            accountsCacheTask = Task {
+                self.cachedAccounts = (try? app.allAccounts()) ?? []
+                self.logger.debug("Keychain accounts cached: \(self.cachedAccounts.count)")
+            }
+        }
         
         // DNS pre-resolution (fire-and-forget): cachear la conexión TCP/TLS
         // al endpoint B2C en paralelo, sin bloquear la inicialización.
@@ -124,6 +150,13 @@ final class AuthenticationService {
             tracer.end(.interactiveSignIn)
             tracer.printSummary()
             
+            // Refrescar cache de cuentas tras autenticación exitosa (fire-and-forget).
+            // Actualizar referencia para que signOut() pueda esperar si es necesario.
+            accountsCacheTask = Task {
+                self.cachedAccounts = (try? application.allAccounts()) ?? []
+                self.logger.debug("Keychain accounts refreshed: \(self.cachedAccounts.count)")
+            }
+            
             let displayName = user.claims.primaryEmail ?? user.claims.fullName ?? "unknown"
             logger.info("Authentication successful for: \(displayName)")
         } catch {
@@ -146,11 +179,16 @@ final class AuthenticationService {
         
         guard let application = msalApplication else { return }
         
+        // Esperar a que el cache de cuentas del Keychain esté poblado.
+        // El await cede control al executor → SwiftUI renderiza primer frame
+        // antes de que allAccounts() bloquee el run loop.
+        await accountsCacheTask?.value
+        
         tracer.begin(.silentSignIn)
         tracer.checkpoint(.silentSignInStart)
         
         do {
-            guard let account = try application.allAccounts().first else {
+            guard let account = cachedAccounts.first else {
                 tracer.end(.silentSignIn)
                 logger.debug("No cached account found")
                 return
@@ -180,6 +218,9 @@ final class AuthenticationService {
     func signOut() async {
         guard let application = msalApplication else { return }
         
+        // Asegurar que el cache esté poblado antes de iterar.
+        await accountsCacheTask?.value
+        
         tracer.begin(.signOut)
         tracer.checkpoint(.signOutStart)
         defer {
@@ -188,9 +229,11 @@ final class AuthenticationService {
         }
         
         do {
-            for account in try application.allAccounts() {
+            for account in cachedAccounts {
                 try application.remove(account)
             }
+            cachedAccounts = []
+            accountsCacheTask = nil
             state = .idle
             logger.info("Sign out successful")
         } catch {
@@ -317,7 +360,9 @@ final class AuthenticationService {
         application: MSALPublicClientApplication,
         from viewController: UIViewController
     ) async throws -> MSALResult {
-        try await withCheckedThrowingContinuation { continuation in
+        let hasAccounts = !cachedAccounts.isEmpty
+        
+        return try await withCheckedThrowingContinuation { continuation in
             // .default usa ASWebAuthenticationSession (iOS 12+)
             // Comparte cookies con Safari → SSO automático
             let webViewParameters = MSALWebviewParameters(
@@ -330,7 +375,6 @@ final class AuthenticationService {
             )
             
             // Optimización: Si hay cuentas cacheadas, usar .login para saltar selección
-            let hasAccounts = (try? application.allAccounts().isEmpty == false) ?? false
             parameters.promptType = hasAccounts ? .login : .selectAccount
             
             // Instrumentación: medir duración del round-trip MSAL ↔ B2C

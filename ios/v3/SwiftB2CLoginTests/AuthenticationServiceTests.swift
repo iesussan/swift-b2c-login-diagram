@@ -160,4 +160,56 @@ struct AuthenticationServiceTests {
         #expect(error.b2cError == b2cError)
         #expect(AuthError.cancelled.b2cError == nil)
     }
+    
+    // MARK: - Silent Auth / Cache Tests
+    
+    @Test("signInSilently returns idle when no cached accounts exist")
+    func silentSignInWithEmptyCacheReturnsIdle() async throws {
+        let logger = MockLogger()
+        let service = AuthenticationService(logger: logger)
+        
+        await service.warmUp()
+        await service.signInSilently()
+        
+        // Sin cuentas reales en Keychain del simulador, debe quedarse en idle
+        let isIdleOrFailed = service.state == .idle || service.state.error != nil
+        #expect(isIdleOrFailed)
+        #expect(logger.debugMessages.contains(where: { $0.localizedStandardContains("No cached account found") }))
+    }
+    
+    @Test("clearError does not affect account cache behavior")
+    func clearErrorPreservesCacheBehavior() async throws {
+        let logger = MockLogger()
+        let service = AuthenticationService(logger: logger)
+        
+        await service.warmUp()
+        
+        // clearError no debe afectar el flujo de silent auth posterior
+        service.clearError()
+        
+        await service.signInSilently()
+        
+        // Debe seguir reportando "No cached account found" — cache intacto
+        #expect(logger.debugMessages.contains(where: { $0.localizedStandardContains("No cached account found") }))
+    }
+    
+    @Test("warmUp logs Keychain accounts cached count")
+    func warmUpLogsCachedCount() async throws {
+        let logger = MockLogger()
+        let service = AuthenticationService(logger: logger)
+        
+        await service.warmUp()
+        
+        // Esperar a que el Task del cache complete
+        try await Task.sleep(for: .milliseconds(200))
+        
+        // Debe haber un log con el conteo de cuentas cacheadas
+        let hasCacheLog = logger.debugMessages.contains(where: { $0.localizedStandardContains("Keychain accounts cached") })
+        
+        // En simulador sin MSAL config real, puede fallar la inicialización.
+        // Si MSAL se inicializó, debe haber log de cache.
+        if logger.infoMessages.contains(where: { $0.localizedStandardContains("MSAL initialized") }) {
+            #expect(hasCacheLog)
+        }
+    }
 }
